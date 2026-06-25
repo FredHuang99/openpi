@@ -5,7 +5,7 @@ desktop clone. They assume Ubuntu 22.04, L4T 36.4.x, CUDA 12.6, cuDNN 9.3, and
 the current OpenPI checkout/branch.
 
 Do not use `uv run` for the final inference commands after installing the
-Jetson PyTorch wheels. Use `.venv/bin/python3.10` directly.
+Jetson PyTorch wheels. Use `.pi0.5/bin/python3.10` directly.
 
 ## 1. Preflight
 
@@ -21,6 +21,19 @@ nvidia-smi || true
 ```
 
 ## 2. System packages
+
+If apt reports unmet dependencies, repair the package state first:
+
+```bash
+sudo apt-get update
+sudo apt --fix-broken install
+sudo apt-get dist-upgrade -y
+sudo apt-get autoremove -y
+sudo apt-get update
+```
+
+If `apt --fix-broken install` proposes removing NVIDIA JetPack packages, stop
+and inspect with `apt-cache policy` before accepting.
 
 ```bash
 sudo apt-get update
@@ -49,6 +62,23 @@ sudo apt-get install -y \
 git lfs install
 ```
 
+Run the remaining project, uv, checkpoint, and inference steps as the normal
+repository owner, for example `hhy`, not as `root`. If you already entered a
+root shell for apt, switch back before continuing:
+
+```bash
+exit
+cd /home/hhy/openpi
+git status --short --branch
+git lfs install
+```
+
+If root-created files now block the normal user, fix ownership once:
+
+```bash
+sudo chown -R hhy:hhy /home/hhy/openpi
+```
+
 ## 3. Install uv and create a clean Python 3.10 environment
 
 ```bash
@@ -60,9 +90,9 @@ export PATH="$HOME/.local/bin:$PATH"
 uv --version
 
 cd ~/openpi
-rm -rf .venv
-uv venv --python 3.10 .venv
-. .venv/bin/activate
+rm -rf .pi0.5
+uv venv --python 3.10 .pi0.5
+. .pi0.5/bin/activate
 python --version
 ```
 
@@ -75,7 +105,7 @@ unless the system Python is unavailable.
 ```bash
 cd ~/openpi
 export PATH="$HOME/.local/bin:$PATH"
-. .venv/bin/activate
+. .pi0.5/bin/activate
 
 GIT_LFS_SKIP_SMUDGE=1 uv lock --python 3.10
 GIT_LFS_SKIP_SMUDGE=1 uv sync --python 3.10 --no-dev
@@ -93,7 +123,7 @@ Python 3.10 Jetson deployment branch.
 ```bash
 cd ~/openpi
 export PATH="$HOME/.local/bin:$PATH"
-. .venv/bin/activate
+. .pi0.5/bin/activate
 
 mkdir -p /tmp/openpi-jetson-wheels
 cd /tmp/openpi-jetson-wheels
@@ -107,7 +137,7 @@ curl -L -o torchvision-0.18.0-cp310-cp310-linux_aarch64.whl \
 
 cd ~/openpi
 uv pip uninstall -y torch torchvision torchaudio || true
-uv pip install --force-reinstall --no-deps \
+UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install --force-reinstall --no-deps \
   /tmp/openpi-jetson-wheels/torch-2.3.0-cp310-cp310-linux_aarch64.whl \
   /tmp/openpi-jetson-wheels/torchvision-0.18.0-cp310-cp310-linux_aarch64.whl \
   /tmp/openpi-jetson-wheels/torchaudio-2.3.0-cp310-cp310-linux_aarch64.whl
@@ -116,7 +146,7 @@ uv pip install --force-reinstall --no-deps \
 Verify CUDA before continuing:
 
 ```bash
-.venv/bin/python3.10 - <<'PY'
+.pi0.5/bin/python3.10 - <<'PY'
 import torch
 print("torch:", torch.__version__)
 print("torch cuda:", torch.version.cuda)
@@ -129,14 +159,19 @@ PY
 
 If this fails to import CUDA, use the Jetson AI Lab fallback:
 
+On headless Jetson sessions, importing `torchvision` may print X11/EGL warnings
+such as `X11 connection rejected` or `nvbufsurftransform: Could not get EGL
+display connection`. Continue if `torch.cuda.is_available()` is `True` and the
+CUDA tensor test succeeds.
+
 ```bash
 cd ~/openpi
-. .venv/bin/activate
+. .pi0.5/bin/activate
 uv pip uninstall -y torch torchvision torchaudio triton || true
 uv pip install --force-reinstall --index-url https://pypi.jetson-ai-lab.io/jp6/cu126 \
   torch==2.11.0 torchvision==0.26.0 torchaudio==2.10.0 triton==3.6.0
 
-.venv/bin/python3.10 - <<'PY'
+.pi0.5/bin/python3.10 - <<'PY'
 import torch
 print("torch:", torch.__version__)
 print("torch cuda:", torch.version.cuda)
@@ -151,19 +186,25 @@ PY
 
 ```bash
 cd ~/openpi
-. .venv/bin/activate
+. .pi0.5/bin/activate
 uv pip show transformers
 
-TRANSFORMERS_DIR=$(.venv/bin/python3.10 - <<'PY'
+TRANSFORMERS_DIR=$(.pi0.5/bin/python3.10 - <<'PY'
 import pathlib
 import transformers
 print(pathlib.Path(transformers.__file__).parent)
 PY
 )
 
-cp -r ./src/openpi/models_pytorch/transformers_replace/* "$TRANSFORMERS_DIR"/
+PATCH_DIR="$PWD/src/openpi/models_pytorch/transformers_replace"
+test -f "$PATCH_DIR/models/siglip/check.py"
+cp -av "$PATCH_DIR"/models/gemma/* "$TRANSFORMERS_DIR"/models/gemma/
+cp -av "$PATCH_DIR"/models/paligemma/* "$TRANSFORMERS_DIR"/models/paligemma/
+cp -av "$PATCH_DIR"/models/siglip/* "$TRANSFORMERS_DIR"/models/siglip/
 
-.venv/bin/python3.10 - <<'PY'
+test -f "$TRANSFORMERS_DIR/models/siglip/check.py"
+
+.pi0.5/bin/python3.10 - <<'PY'
 from transformers.models.siglip import check
 print("transformers_replace ok:", check.check_whether_transformers_replace_is_installed_correctly())
 PY
@@ -173,9 +214,9 @@ PY
 
 ```bash
 cd ~/openpi
-. .venv/bin/activate
+. .pi0.5/bin/activate
 
-.venv/bin/python3.10 - <<'PY'
+.pi0.5/bin/python3.10 - <<'PY'
 from openpi.shared import download
 path = download.maybe_download("gs://openpi-assets/checkpoints/pi05_droid")
 print(path)
@@ -192,13 +233,13 @@ rm -rf "$HOME/.cache/openpi/openpi-assets/checkpoints/pi05_droid"*
 
 ```bash
 cd ~/openpi
-. .venv/bin/activate
+. .pi0.5/bin/activate
 
 CKPT="$HOME/.cache/openpi/openpi-assets/checkpoints/pi05_droid"
 OUT="$PWD/torch_pi05_droid"
 
 rm -rf "$OUT"
-.venv/bin/python3.10 examples/convert_jax_model_to_pytorch.py \
+.pi0.5/bin/python3.10 examples/convert_jax_model_to_pytorch.py \
   --checkpoint_dir "$CKPT" \
   --config_name pi05_droid \
   --output_path "$OUT" \
@@ -216,7 +257,7 @@ test -f "$OUT/assets/droid/norm_stats.json"
 
 ```bash
 cd ~/openpi
-.venv/bin/python3.10 scripts/pi05_droid_smoke.py \
+.pi0.5/bin/python3.10 scripts/pi05_droid_smoke.py \
   --checkpoint-dir ./torch_pi05_droid \
   --num-steps 10 \
   --warmup-steps 2 \
@@ -232,18 +273,18 @@ Run this in shell 1:
 
 ```bash
 cd ~/openpi
-.venv/bin/python3.10 scripts/serve_policy.py \
+.pi0.5/bin/python3.10 scripts/serve_policy.py \
+  --port=8000 \
   policy:checkpoint \
   --policy.config=pi05_droid \
-  --policy.dir=./torch_pi05_droid \
-  --port=8000
+  --policy.dir=./torch_pi05_droid
 ```
 
 After the server finishes loading, run this in shell 2:
 
 ```bash
 cd ~/openpi
-.venv/bin/python3.10 examples/simple_client/main.py \
+.pi0.5/bin/python3.10 examples/simple_client/main.py \
   --env DROID \
   --host 127.0.0.1 \
   --port 8000 \
