@@ -12,6 +12,26 @@ robot or RoboArena evaluation, so `policy_task_success` is reported as `null`.
 - `examples/droid_demo/remote_demo_server.py`: Jetson-side DROID raw replay and browser stream, port `8765`.
 - `examples/droid_demo/local_viewer.py`: local Win11/mac browser UI, port `7860`.
 
+## Fresh Tasks
+
+The local viewer has `Connect`, `Stop`, and `Fresh` controls in one toolbar.
+`Fresh` closes the current WebSocket connection and asks the remote demo server
+for a new DROID replay task. The new task must use a different `episode_dir`
+from the current or previous task; when multiple prompts are available, the
+server prefers an episode with a different prompt too.
+
+Fresh requires the remote server to be started with `--data-root` and at least
+two usable raw DROID episodes under that directory. If the server is pinned with
+`--episode-dir`, or if only one episode is available, Fresh returns an explicit
+`fresh_unavailable` error instead of replaying the same task again.
+
+Check the remote episode count with:
+
+```bash
+find /home/openpi/droid_demo_data \( -name trajectory.h5 -o -name trajectory.hdf5 \) \
+  -exec dirname {} \; | sort -u | wc -l
+```
+
 ## Remote Jetson
 
 Install the one extra raw-DROID reader dependency if needed:

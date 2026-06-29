@@ -48,7 +48,7 @@ py -3 --version
 如果没有 Python，任选一种方式安装：
 
 ```powershell
-winget install Python.Python.3.12
+winget install -e --id Python.Python.3.12 --source winget
 ```
 
 或者从 `https://www.python.org/downloads/windows/` 安装，并勾选 `Add python.exe
@@ -113,9 +113,19 @@ sudo apt-get install -y ffmpeg
 检查数据目录里能找到 episode：
 
 ```bash
-find /home/openpi/droid_demo_data -name trajectory.h5 | head
+find /home/openpi/droid_demo_data \( -name trajectory.h5 -o -name trajectory.hdf5 \) | head
 find /home/openpi/droid_demo_data -path "*/recordings/MP4" | head
 ```
+
+Fresh 按钮要求至少 2 个可用 episode。用下面的命令检查数量：
+
+```bash
+find /home/openpi/droid_demo_data \( -name trajectory.h5 -o -name trajectory.hdf5 \) \
+  -exec dirname {} \; | sort -u | wc -l
+```
+
+如果输出是 `1`，`Connect` 可以正常跑，但 `Fresh` 会返回 `fresh_unavailable`，
+因为不能重复旧任务。
 
 ## 5. 远端启动 policy server
 
@@ -168,6 +178,9 @@ cd /home/openpi
 ```bash
 --stream-mode every-frame --realtime
 ```
+
+不要用 `--episode-dir` 固定单个 episode 来启动 Fresh demo。固定 `--episode-dir`
+时 `Connect` 可以跑，但 `Fresh` 会明确返回 `fresh_unavailable`。
 
 ## 7. 本地直连观看
 
@@ -229,7 +242,26 @@ python3 examples/droid_demo/local_viewer.py --remote-ws ws://127.0.0.1:8765/ws -
 SSH tunnel 模式下，本地 viewer 必须使用 `ws://127.0.0.1:8765/ws`，不要使用
 `ws://JETSON_IP:8765/ws`。
 
-## 9. 运行产物
+## 9. Connect、Stop、Fresh
+
+- `Connect`: 连接远端 streaming server，并启动一个 DROID replay 任务。
+- `Stop`: 断开当前浏览器连接。远端 run 最多会在当前 blocking policy query
+  结束后感知断连。
+- `Fresh`: 断开旧连接并请求远端启动新任务。新任务的 `episode_dir` 必须不同于
+  当前或上一次任务；如果存在不同 prompt 的候选 episode，服务端会优先选择不同
+  prompt。
+
+Fresh 请求会在 WebSocket URL 上追加 `fresh=1`、`exclude_episode`、
+`exclude_prompt` 和 `nonce`。这些参数由本地 viewer 自动处理，用户不需要手动填写。
+
+Fresh 不可用时，页面会显示 `fresh_unavailable`，常见原因是：
+
+- `--data-root` 下只有 1 个可用 raw episode。
+- 远端 streaming server 使用了固定 `--episode-dir`。
+- episode 目录缺少 `trajectory.h5` 或 `trajectory.hdf5`。
+- episode 目录缺少 `recordings/MP4`。
+
+## 10. 运行产物
 
 远端 demo server 会写入：
 
@@ -241,7 +273,7 @@ SSH tunnel 模式下，本地 viewer 必须使用 `ws://127.0.0.1:8765/ws`，不
 如果当前环境缺少 MP4 encoder，`metrics.json` 仍会写出，最终 JSON 里会包含
 `video_error`。
 
-## 10. 常见问题
+## 11. 常见问题
 
 ### 本地网页打开但没有帧
 
@@ -280,7 +312,7 @@ ss -ltnp | grep 8000
 确认传给 `--data-root` 的目录包含 DROID raw episode：
 
 ```bash
-find /home/openpi/droid_demo_data -name trajectory.h5 | head
+find /home/openpi/droid_demo_data \( -name trajectory.h5 -o -name trajectory.hdf5 \) | head
 find /home/openpi/droid_demo_data -path "*/recordings/MP4" | head
 ```
 
@@ -292,6 +324,18 @@ find /home/openpi/droid_demo_data -path "*/recordings/MP4" | head
   --episode-dir /home/openpi/droid_demo_data/2023-12-04/<episode_dir> \
   --dry-run
 ```
+
+### Fresh 显示 `fresh_unavailable`
+
+先确认 episode 数量：
+
+```bash
+find /home/openpi/droid_demo_data \( -name trajectory.h5 -o -name trajectory.hdf5 \) \
+  -exec dirname {} \; | sort -u | wc -l
+```
+
+如果数量小于 2，需要再放入至少一个 DROID raw episode。也要确认 streaming server
+不是用 `--episode-dir` 固定启动的。
 
 ### Windows 防火墙或公司网络拦截端口
 

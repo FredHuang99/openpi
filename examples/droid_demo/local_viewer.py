@@ -188,6 +188,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <input id="ws-url" aria-label="WebSocket URL">
         <button id="connect" class="primary">Connect</button>
         <button id="disconnect">Stop</button>
+        <button id="fresh">Fresh</button>
       </div>
       <div class="image-grid">
         <figure>
@@ -204,6 +205,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div class="side-title">Run State</div>
       <div class="kv">
         <div>Run</div><div id="run-id">-</div>
+        <div>Task</div><div id="task-id">-</div>
         <div>Prompt</div><div id="prompt">-</div>
         <div>Frame</div><div id="frame">-</div>
         <div>Queries</div><div id="queries">-</div>
@@ -224,6 +226,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     const metricsEl = document.getElementById("metrics");
     let socket = null;
     let finished = false;
+    let connectionGeneration = 0;
+    let freshNonce = 0;
+    let currentTask = {
+      episodeDir: null,
+      prompt: null,
+      runId: null,
+      taskId: null,
+    };
 
     wsInput.value = params.get("ws") || defaultWs;
 
@@ -234,6 +244,16 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     function setText(id, value) {
       document.getElementById(id).textContent = value ?? "-";
+    }
+
+    function clearRunUi() {
+      for (const id of ["exterior", "wrist"]) {
+        document.getElementById(id).removeAttribute("src");
+      }
+      for (const id of ["run-id", "task-id", "prompt", "frame", "queries", "roundtrip", "server-infer", "action"]) {
+        setText(id, "-");
+      }
+      setMetrics({});
     }
 
     function formatMs(stats) {
@@ -248,22 +268,71 @@ HTML_TEMPLATE = r"""<!doctype html>
       setText("server-infer", formatMs(metrics?.server_infer_ms));
     }
 
-    function connect() {
+    function buildWebSocketUrl({ fresh = false } = {}) {
+      const url = new URL(wsInput.value.trim());
+      if (fresh) {
+        url.searchParams.set("fresh", "1");
+        if (currentTask.episodeDir) {
+          url.searchParams.set("exclude_episode", currentTask.episodeDir);
+        }
+        if (currentTask.prompt) {
+          url.searchParams.set("exclude_prompt", currentTask.prompt);
+        }
+        url.searchParams.set("nonce", String(++freshNonce));
+      } else {
+        url.searchParams.delete("fresh");
+        url.searchParams.delete("exclude_episode");
+        url.searchParams.delete("exclude_prompt");
+        url.searchParams.delete("nonce");
+      }
+      return url.toString();
+    }
+
+    function updateCurrentTask(event) {
+      currentTask = {
+        episodeDir: event.episode_dir || event.episode?.episode_dir || event.selection?.episode_dir || null,
+        prompt: event.prompt || event.episode?.prompt || event.selection?.prompt || null,
+        runId: event.run_id || null,
+        taskId: event.task_id || event.episode?.task_id || event.selection?.task_id || null,
+      };
+      setText("run-id", currentTask.runId);
+      setText("task-id", currentTask.taskId);
+      setText("prompt", currentTask.prompt);
+    }
+
+    function connect(options = {}) {
+      const fresh = Boolean(options.fresh);
+      const generation = ++connectionGeneration;
       if (socket) socket.close();
       finished = false;
-      setStatus("connecting", "");
-      const url = wsInput.value.trim();
+      clearRunUi();
+      setStatus(fresh ? "freshing" : "connecting", "");
+
+      let url;
+      try {
+        url = buildWebSocketUrl({ fresh });
+      } catch (error) {
+        setStatus("bad WebSocket URL", "error");
+        setMetrics({ type: "error", message: String(error) });
+        return;
+      }
+
       socket = new WebSocket(url);
-      socket.onopen = () => setStatus("live", "live");
+      socket.onopen = () => {
+        if (generation === connectionGeneration) setStatus("live", "live");
+      };
       socket.onclose = () => {
+        if (generation !== connectionGeneration) return;
         if (!finished) setStatus("closed", "");
       };
-      socket.onerror = () => setStatus("error", "error");
+      socket.onerror = () => {
+        if (generation === connectionGeneration) setStatus("error", "error");
+      };
       socket.onmessage = (message) => {
+        if (generation !== connectionGeneration) return;
         const event = JSON.parse(message.data);
         if (event.type === "run_started") {
-          setText("run-id", event.run_id);
-          setText("prompt", event.episode?.prompt);
+          updateCurrentTask(event);
           setMetrics({});
         } else if (event.type === "action_chunk") {
           setText("queries", event.query_index);
@@ -286,10 +355,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       };
     }
 
-    document.getElementById("connect").addEventListener("click", connect);
+    document.getElementById("connect").addEventListener("click", () => connect());
     document.getElementById("disconnect").addEventListener("click", () => {
+      connectionGeneration += 1;
       if (socket) socket.close();
+      setStatus("stopped", "");
     });
+    document.getElementById("fresh").addEventListener("click", () => connect({ fresh: true }));
     connect();
   </script>
 </body>

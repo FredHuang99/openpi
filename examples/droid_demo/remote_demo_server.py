@@ -11,7 +11,9 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import dataclasses
 import datetime as dt
+import hashlib
 import http
 import io
 import json
@@ -19,6 +21,7 @@ import logging
 import pathlib
 import statistics
 import time
+import urllib.parse
 from typing import Any
 
 import numpy as np
@@ -31,6 +34,21 @@ import websockets.asyncio.server as ws_server
 LOGGER = logging.getLogger("pi05_droid_demo")
 
 DROID_CONTROL_FREQUENCY = 15
+
+
+class FreshUnavailableError(RuntimeError):
+    code = "fresh_unavailable"
+
+
+@dataclasses.dataclass(frozen=True)
+class EpisodeCandidate:
+    episode_dir: pathlib.Path
+    prompt: str
+    dataset_success: bool | None
+
+    @property
+    def task_id(self) -> str:
+        return _task_id(self.episode_dir, self.prompt)
 
 
 def _json_default(value: Any) -> Any:
@@ -140,15 +158,151 @@ def _dataset_success_from_path(episode_dir: pathlib.Path) -> bool | None:
     return None
 
 
+def _task_id(episode_dir: pathlib.Path, prompt: str) -> str:
+    text = f"{episode_dir.resolve()}::{prompt}"
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _episode_dirs(data_root: pathlib.Path) -> list[pathlib.Path]:
+    matches = sorted([*data_root.glob("**/trajectory.h5"), *data_root.glob("**/trajectory.hdf5")])
+    episode_dirs = []
+    seen: set[pathlib.Path] = set()
+    for match in matches:
+        episode_dir = match.parent.resolve()
+        if episode_dir in seen:
+            continue
+        if (episode_dir / "recordings" / "MP4").exists():
+            episode_dirs.append(episode_dir)
+            seen.add(episode_dir)
+    return episode_dirs
+
+
+def _episode_catalog(
+    data_root: pathlib.Path,
+    annotations_path: pathlib.Path | None,
+    fallback_prompt: str,
+) -> list[EpisodeCandidate]:
+    return [
+        EpisodeCandidate(
+            episode_dir=episode_dir,
+            prompt=_prompt_for_episode(episode_dir, data_root, annotations_path, fallback_prompt),
+            dataset_success=_dataset_success_from_path(episode_dir),
+        )
+        for episode_dir in _episode_dirs(data_root)
+    ]
+
+
+def _parse_websocket_query(websocket: ws_server.ServerConnection) -> dict[str, str]:
+    request = getattr(websocket, "request", None)
+    path = getattr(request, "path", None) or getattr(websocket, "path", "") or ""
+    parsed = urllib.parse.urlparse(path)
+    values = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    return {key: value[-1] for key, value in values.items()}
+
+
+def _query_bool(query: dict[str, str], key: str) -> bool:
+    return query.get(key, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _resolved_query_path(value: str | None) -> pathlib.Path | None:
+    if not value:
+        return None
+    return pathlib.Path(value).expanduser().resolve()
+
+
+def _choose_next_candidate(
+    catalog: list[EpisodeCandidate],
+    pool: list[EpisodeCandidate],
+    excluded_episode: pathlib.Path | None,
+) -> EpisodeCandidate:
+    if excluded_episode is None:
+        return pool[0]
+
+    pool_dirs = {candidate.episode_dir.resolve() for candidate in pool}
+    catalog_dirs = [candidate.episode_dir.resolve() for candidate in catalog]
+    try:
+        start_index = catalog_dirs.index(excluded_episode.resolve()) + 1
+    except ValueError:
+        start_index = 0
+
+    for offset in range(len(catalog)):
+        candidate = catalog[(start_index + offset) % len(catalog)]
+        if candidate.episode_dir.resolve() in pool_dirs:
+            return candidate
+    return pool[0]
+
+
+def _select_episode_for_request(args: argparse.Namespace, query: dict[str, str]) -> tuple[pathlib.Path, dict[str, Any]]:
+    data_root = pathlib.Path(args.data_root).resolve()
+    annotations_path = pathlib.Path(args.annotations_path) if args.annotations_path else None
+    fresh_requested = _query_bool(query, "fresh")
+    excluded_episode = _resolved_query_path(query.get("exclude_episode"))
+    excluded_prompt = query.get("exclude_prompt") or None
+
+    if args.episode_dir:
+        episode_dir = pathlib.Path(args.episode_dir).expanduser().resolve()
+        prompt = _prompt_for_episode(episode_dir, data_root, annotations_path, args.prompt)
+        if fresh_requested:
+            raise FreshUnavailableError(
+                "Fresh is unavailable because remote_demo_server.py was started with --episode-dir. "
+                "Start it with --data-root containing at least two raw DROID episodes."
+            )
+        return episode_dir, {
+            "task_id": _task_id(episode_dir, prompt),
+            "episode_dir": str(episode_dir),
+            "prompt": prompt,
+            "episode_count": 1,
+            "fresh_requested": False,
+            "excluded_episode_dir": str(excluded_episode) if excluded_episode else None,
+            "excluded_prompt": excluded_prompt,
+        }
+
+    catalog = _episode_catalog(data_root, annotations_path, args.prompt)
+    if not catalog:
+        raise FileNotFoundError(
+            f"No usable DROID episode found under {data_root}. Expected trajectory.h5 or trajectory.hdf5 "
+            "plus a recordings/MP4 directory."
+        )
+
+    if not fresh_requested:
+        chosen = catalog[0]
+    else:
+        alternatives = [
+            candidate
+            for candidate in catalog
+            if excluded_episode is None or candidate.episode_dir.resolve() != excluded_episode.resolve()
+        ]
+        if not alternatives:
+            raise FreshUnavailableError(
+                "Fresh requires at least two distinct raw DROID episodes under --data-root; "
+                "the server found no replacement for the current episode."
+            )
+        prompt_alternatives = [
+            candidate for candidate in alternatives if excluded_prompt is None or candidate.prompt != excluded_prompt
+        ]
+        chosen = _choose_next_candidate(catalog, prompt_alternatives or alternatives, excluded_episode)
+
+    return chosen.episode_dir, {
+        "task_id": chosen.task_id,
+        "episode_dir": str(chosen.episode_dir),
+        "prompt": chosen.prompt,
+        "episode_count": len(catalog),
+        "fresh_requested": fresh_requested,
+        "excluded_episode_dir": str(excluded_episode) if excluded_episode else None,
+        "excluded_prompt": excluded_prompt,
+    }
+
+
 def _find_episode_dir(data_root: pathlib.Path, episode_dir: pathlib.Path | None) -> pathlib.Path:
     if episode_dir is not None:
         return episode_dir.resolve()
-    matches = sorted([*data_root.glob("**/trajectory.h5"), *data_root.glob("**/trajectory.hdf5")])
+    matches = _episode_dirs(data_root)
     if not matches:
         raise FileNotFoundError(
-            f"No DROID episode found under {data_root}. Expected a trajectory.h5 or trajectory.hdf5 file."
+            f"No usable DROID episode found under {data_root}. Expected trajectory.h5 or trajectory.hdf5 "
+            "plus a recordings/MP4 directory."
         )
-    return matches[0].parent.resolve()
+    return matches[0].resolve()
 
 
 def _trajectory_path(episode_dir: pathlib.Path) -> pathlib.Path:
@@ -240,6 +394,7 @@ class DroidRawEpisode:
         self.trajectory_path = _trajectory_path(self.episode_dir)
         self.recording_dir = _recording_dir(self.episode_dir)
         self.prompt = _prompt_for_episode(self.episode_dir, self.data_root, annotations_path, fallback_prompt)
+        self.task_id = _task_id(self.episode_dir, self.prompt)
         self.dataset_success = _dataset_success_from_path(self.episode_dir)
 
         self._h5 = h5py.File(self.trajectory_path, "r")
@@ -323,6 +478,7 @@ class DroidRawEpisode:
 
     def metadata(self) -> dict[str, Any]:
         return {
+            "task_id": self.task_id,
             "episode_dir": str(self.episode_dir),
             "trajectory_path": str(self.trajectory_path),
             "recording_dir": str(self.recording_dir),
@@ -340,11 +496,12 @@ class DroidRawEpisode:
 
 
 class DemoRun:
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, query: dict[str, str] | None = None) -> None:
         self.args = args
-        self.run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.query = query or {}
+        self.run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.output_dir = pathlib.Path(args.output_dir) / self.run_id
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.selection: dict[str, Any] = {}
         self.client_roundtrip_ms: list[float] = []
         self.server_infer_ms: list[float] = []
         self.server_prev_total_ms: list[float] = []
@@ -362,6 +519,12 @@ class DemoRun:
         elapsed_s = max((time.perf_counter() - self.run_start_time) if self.run_start_time is not None else 0.0, 1e-9)
         return {
             "run_id": self.run_id,
+            "task_id": episode.task_id,
+            "episode_dir": str(episode.episode_dir),
+            "prompt": episode.prompt,
+            "episode_count": self.selection.get("episode_count"),
+            "fresh_requested": self.selection.get("fresh_requested", False),
+            "excluded_episode_dir": self.selection.get("excluded_episode_dir"),
             "run_completed": completed,
             "dataset_demo_success": episode.dataset_success,
             "policy_task_success": None,
@@ -392,9 +555,11 @@ class DemoRun:
             return None, str(exc)
 
     async def run(self, websocket: ws_server.ServerConnection) -> None:
+        selected_episode_dir, self.selection = _select_episode_for_request(self.args, self.query)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         episode = DroidRawEpisode(
             pathlib.Path(self.args.data_root),
-            pathlib.Path(self.args.episode_dir) if self.args.episode_dir else None,
+            selected_episode_dir,
             annotations_path=pathlib.Path(self.args.annotations_path) if self.args.annotations_path else None,
             fallback_prompt=self.args.prompt,
             exterior_camera_stem=self.args.exterior_camera_stem,
@@ -407,7 +572,14 @@ class DemoRun:
                 {
                     "type": "run_started",
                     "run_id": self.run_id,
+                    "task_id": episode.task_id,
+                    "episode_dir": str(episode.episode_dir),
+                    "prompt": episode.prompt,
+                    "episode_count": self.selection.get("episode_count"),
+                    "fresh_requested": self.selection.get("fresh_requested", False),
+                    "excluded_episode_dir": self.selection.get("excluded_episode_dir"),
                     "episode": episode.metadata(),
+                    "selection": self.selection,
                     "policy_server_metadata": policy.get_server_metadata(),
                     "stream_mode": self.args.stream_mode,
                     "open_loop_horizon": self.args.open_loop_horizon,
@@ -514,9 +686,14 @@ def _health_check(connection: ws_server.ServerConnection, request: ws_server.Req
 async def _handler(websocket: ws_server.ServerConnection, args: argparse.Namespace) -> None:
     LOGGER.info("Viewer connected: %s", websocket.remote_address)
     try:
-        await DemoRun(args).run(websocket)
+        query = _parse_websocket_query(websocket)
+        await DemoRun(args, query).run(websocket)
     except websockets.ConnectionClosed:
         LOGGER.info("Viewer disconnected: %s", websocket.remote_address)
+    except FreshUnavailableError as exc:
+        LOGGER.info("Fresh request unavailable: %s", exc)
+        with contextlib.suppress(Exception):
+            await websocket.send(json.dumps({"type": "error", "code": exc.code, "message": str(exc)}))
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Demo run failed")
         with contextlib.suppress(Exception):
